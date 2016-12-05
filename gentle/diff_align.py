@@ -3,9 +3,12 @@ import json
 import os
 import sys
 
-import metasentence
-import language_model
-import standard_kaldi
+from gentle import metasentence
+from gentle import language_model
+from gentle import standard_kaldi
+from gentle import transcription
+from gentle.resources import Resources
+
 
 # TODO(maxhawkins): try using the (apparently-superior) time-mediated dynamic
 # programming algorithm used in sclite's alignment process:
@@ -21,7 +24,7 @@ def align(alignment, ms, **kwargs):
     disfluency = kwargs['disfluency'] if 'disfluency' in kwargs else False
     disfluencies = kwargs['disfluencies'] if 'disfluencies' in kwargs else []
 
-    hypothesis = [X["word"] for X in alignment]
+    hypothesis = [X.word for X in alignment]
     reference = ms.get_kaldi_sequence()
 
     display_seq = ms.get_display_sequence()
@@ -34,17 +37,14 @@ def align(alignment, ms, **kwargs):
             word = hypothesis[a]
             if disfluency and word in disfluencies:
                 hyp_token = alignment[a]
-                phones = hyp_token.get("phones", [])
-                start = hyp_token["start"]
-                end = hyp_token["start"] + hyp_token["duration"]
+                phones = hyp_token.phones or []
 
-                out.append({
-                    "case": "not-found-in-transcript",
-                    "phones": phones,
-                    "start": start,
-                    "end": end,
-                    "word": word
-                })
+                out.append(transcription.Word(
+                    case="not-found-in-transcript",
+                    phones=phones,
+                    start=hyp_token.start,
+                    duration=hyp_token.duration,
+                    word=word))
             continue
 
         display_word = display_seq[b]
@@ -53,28 +53,24 @@ def align(alignment, ms, **kwargs):
         if op == 'equal':
             hyp_word = hypothesis[a]
             hyp_token = alignment[a]
-            phones = hyp_token.get("phones", [])
-            start = hyp_token["start"]
-            end = hyp_token["start"] + hyp_token["duration"]
+            phones = hyp_token.phones or []
 
-            out.append({
-                "case": "success",
-                "startOffset": start_offset,
-                "endOffset": end_offset,
-                "word": display_word,
-                "alignedWord": hyp_word,
-                "phones": phones,
-                "start": start,
-                "end": end,
-            })
+            out.append(transcription.Word(
+                case="success",
+                startOffset=start_offset,
+                endOffset=end_offset,
+                word=display_word,
+                alignedWord=hyp_word,
+                phones=phones,
+                start=hyp_token.start,
+                duration=hyp_token.duration))
 
         elif op in ['insert', 'replace']:
-            out.append({
-                "case": "not-found-in-audio",
-                "startOffset": start_offset,
-                "endOffset": end_offset,
-                "word": display_word,
-            })
+            out.append(transcription.Word(
+                case="not-found-in-audio",
+                startOffset=start_offset,
+                endOffset=end_offset,
+                word=display_word))
     return out
 
 def word_diff(a, b):
@@ -97,18 +93,23 @@ def by_word(opcodes):
             for i in range(s2, e2):
                 yield (op, s1, s1, i, i+1)
         else:
+            len1 = e1-s1
+            len2 = e2-s2
             for i1, i2 in zip(range(s1, e1), range(s2, e2)):
                 yield (op, i1, i1 + 1, i2, i2 + 1)
+            if len1 > len2:
+                for i in range(s1 + len2, e1):
+                    yield ('delete', i, i+1, e2, e2)
+            if len2 > len1:
+                for i in range(s2 + len1, e2):
+                    yield ('insert', s1, s1, i, i+1)
 
 if __name__=='__main__':
     TEXT_FILE = sys.argv[1]
     JSON_FILE = sys.argv[2]
     OUTPUT_FILE = sys.argv[3]
 
-    with open('data/graph/words.txt') as f:
-        vocab = metasentence.load_vocabulary(f)
-
-    ms = metasentence.MetaSentence(open(TEXT_FILE).read(), vocab)
+    ms = metasentence.MetaSentence(open(TEXT_FILE).read(), Resources().vocab)
     alignment = json.load(open(JSON_FILE))['words']
 
     out = align(alignment, ms)
