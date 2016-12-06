@@ -1,368 +1,60 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-
-
-# PMB Twisted server not needed for standalone
-#from twisted.web.static import File
-#from twisted.web.resource import Resource
-#from twisted.web.server import Site, NOT_DONE_YET
-#from twisted.internet import reactor, threads
-#from twisted.web._responses import FOUND
-
-import sys
-import codecs
-import json
+import argparse
 import logging
 import multiprocessing
 import os
-#from Queue import Queue
-import shutil
-import uuid
-import wave
-
-from gentle.paths import get_resource, get_datadir
-from gentle.transcription import Transcription
-from gentle.cyst import Insist
-from gentle.ffmpeg import to_wav
-from gentle import diff_align
-from gentle import language_model
-from gentle import metasentence
-from gentle import multipass
-from gentle import standard_kaldi
-import gentle
-
-from util.paths import get_resource, get_datadir
-from util.cyst import Insist
+import sys
 
 import gentle
 
-# PMB: Not used in standalone case
-#class TranscriptionStatus(Resource):
-#    def __init__(self, status_dict):
-#        self.status_dict = status_dict
-#        Resource.__init__(self)
-#
-#    def render_GET(self, req):
-#        req.setHeader("Content-Type", "application/json")
-#        return json.dumps(self.status_dict)
-
-class Transcriber():
-    def __init__(self, data_dir, nthreads=4, ntranscriptionthreads=2):
-        self.data_dir = data_dir
-        self.nthreads = nthreads
-        self.ntranscriptionthreads = ntranscriptionthreads
-        self.resources = gentle.Resources()
-
-        self.full_transcriber = gentle.FullTranscriber(self.resources, nthreads=ntranscriptionthreads)
-        self._status_dicts = {}
-
-    def get_status(self, uid):
-        return self._status_dicts.setdefault(uid, {})
-
-    def out_dir(self, uid):
-        return os.path.join(self.data_dir, 'transcriptions', uid)
-
-    # TODO(maxhawkins): refactor so this is returned by transcribe()
-    def next_id(self):
-        uid = None
-        while uid is None or os.path.exists(os.path.join(self.data_dir, uid)):
-            uid = uuid.uuid4().get_hex()[:8]
-        return uid
-
-    def transcribe(self, uid, transcript, audio, async, **kwargs):
-
-        status = self.get_status(uid)
-
-        status['status'] = 'STARTED'
-        output = {
-            'transcript': transcript
-        }
-
-        outdir = os.path.join(self.data_dir, 'transcriptions', uid)
-
-        tran_path = os.path.join(outdir, 'transcript.txt')
-        with open(tran_path, 'w') as tranfile:
-            tranfile.write(transcript)
-        audio_path = os.path.join(outdir, 'upload')
-        with open(audio_path, 'w') as wavfile:
-            wavfile.write(audio)
-
-        status['status'] = 'ENCODING'
-
-        wavfile = os.path.join(outdir, 'a.wav')
-        if gentle.resample(os.path.join(outdir, 'upload'), wavfile) != 0:
-            status['status'] = 'ERROR'
-            status['error'] = "Encoding failed. Make sure that you've uploaded a valid media file."
-            # Save the status so that errors are recovered on restart of the server
-            # XXX: This won't work, because the endpoint will override this file
-            with open(os.path.join(outdir, 'status.json'), 'w') as jsfile:
-                json.dump(status, jsfile, indent=2)
-            return
-
-        #XXX: Maybe we should pass this wave object instead of the
-        # file path to align_progress
-        wav_obj = wave.open(wavfile, 'r')
-        status['duration'] = wav_obj.getnframes() / float(wav_obj.getframerate())
-        status['status'] = 'TRANSCRIBING'
-
-        def on_progress(p):
-            for k,v in p.items():
-                status[k] = v
-
-        if len(transcript.strip()) > 0:
-            trans = gentle.ForcedAligner(self.resources, transcript, nthreads=self.nthreads, **kwargs)
-        elif self.full_transcriber.available:
-            trans = self.full_transcriber
-        else:
-            status['status'] = 'ERROR'
-            status['error']  = 'No transcript provided and no language model for full transcription'
-            return
-
-        output = trans.transcribe(wavfile, progress_cb=on_progress, logging=logging)
-
-        # ...remove the original upload
-        os.unlink(os.path.join(outdir, 'upload'))
-
-        # Save
-        with open(os.path.join(outdir, 'align.json'), 'w') as jsfile:
-            jsfile.write(output.to_json(indent=2))
-        with open(os.path.join(outdir, 'align.csv'), 'w') as csvfile:
-            csvfile.write(output.to_csv())
-
-        # Inline the alignment into the index.html file.
-        htmltxt = open(get_resource('www/view_alignment.html')).read()
-        htmltxt = htmltxt.replace("var INLINE_JSON;", "var INLINE_JSON=%s;" % (output.to_json()));
-        open(os.path.join(outdir, 'index.html'), 'w').write(htmltxt)
-
-        status['status'] = 'OK'
-
-        logging.info('done with transcription.')
-
-        return output
-
-# PMB: Not needed in standalone case
-"""
-class TranscriptionsController(Resource):
-    def __init__(self, transcriber):
-        Resource.__init__(self)
-        self.transcriber = transcriber
-
-    def getChild(self, uid, req):
-        out_dir = self.transcriber.out_dir(uid)
-        trans_ctrl = File(out_dir)
-
-        # Add a Status endpoint to the file
-        trans_status = TranscriptionStatus(self.transcriber.get_status(uid))
-        trans_ctrl.putChild("status.json", trans_status)
-
-        return trans_ctrl
-
-    def render_POST(self, req):
-        uid = self.transcriber.next_id()
-
-        tran = req.args.get('transcript', [''])[0]
-        audio = req.args['audio'][0]
-
-        disfluency = True if 'disfluency' in req.args else False
-        conservative = True if 'conservative' in req.args else False
-        kwargs = {'disfluency': disfluency,
-                  'conservative': conservative,
-                  'disfluencies': set(['uh', 'um'])}
-
-        async = True
-        if 'async' in req.args and req.args['async'][0] == 'false':
-            async = False
-
-        # We need to make the transcription directory here, so that
-        # when we redirect the user we are sure that there's a place
-        # for them to go.
-        outdir = os.path.join(self.transcriber.data_dir, 'transcriptions', uid)
-        os.makedirs(outdir)
-
-        # Copy over the HTML
-        shutil.copy(get_resource('www/view_alignment.html'), os.path.join(outdir, 'index.html'))
-
-        result_promise = threads.deferToThreadPool(
-            reactor, reactor.getThreadPool(),
-            self.transcriber.transcribe,
-            uid, tran, audio, async, **kwargs)
-
-        if not async:
-            def write_result(result):
-                '''Write JSON to client on completion'''
-                req.setHeader("Content-Type", "application/json")
-                req.write(json.dumps(result, indent=2))
-                req.finish()
-            result_promise.addCallback(write_result)
-            result_promise.addErrback(lambda _: None) # ignore errors
-
-            req.notifyFinish().addErrback(lambda _: result_promise.cancel())
-
-            return NOT_DONE_YET
-
-        #req.setResponseCode(FOUND)
-        #req.setHeader(b"Location", "/transcriptions/%s" % (uid))
-        return ''
-"""
-
-
-class LazyZipper(Insist):
-    def __init__(self, cachedir, transcriber, uid):
-        self.transcriber = transcriber
-        self.uid = uid
-        Insist.__init__(self, os.path.join(cachedir, '%s.zip' % (uid)))
-
-    def serialize_computation(self, outpath):
-        shutil.make_archive('.'.join(outpath.split('.')[:-1]), # We need to strip the ".zip" from the end
-                            "zip",                             # ...because `shutil.make_archive` adds it back
-                            os.path.join(self.transcriber.out_dir(self.uid)))
-
-# PMB Not needed in standalone case
-"""
-class TranscriptionZipper(Resource):
-    def __init__(self, cachedir, transcriber):
-        self.cachedir = cachedir
-        self.transcriber = transcriber
-        Resource.__init__(self)
-
-    def getChild(self, path, req):
-        uid = path.split('.')[0]
-        t_dir = self.transcriber.out_dir(uid)
-        if os.path.exists(t_dir):
-            # TODO: Check that "status" is complete and only create a LazyZipper if so
-            # Otherwise, we could have incomplete transcriptions that get permanently zipped.
-            # For now, a solution will be hiding the button in the client until it's done.
-            lz = LazyZipper(self.cachedir, self.transcriber, uid)
-            self.putChild(path, lz)
-            return lz
-        else:
-            return Resource.getChild(self, path, req)
-"""
-
-def make_transcription_alignment(trans):
-    # Spoof the `diff_align` output format
-    transcript = ""
-    words = []
-    for t_wd in trans["words"]:
-        word = {
-            "case": "success",
-            "startOffset": len(transcript),
-            "endOffset": len(transcript) + len(t_wd["word"]),
-            "word": t_wd["word"],
-            "alignedWord": t_wd["word"],
-            "phones": t_wd["phones"],
-            "start": t_wd["start"],
-            "end": t_wd["start"] + t_wd["duration"]}
-        words.append(word)
-
-        transcript += word["word"] + " "
-
-    trans["transcript"] = transcript
-    trans["words"] = words
-    return trans
-
-def do_align(tranfile, audiofile, disfluency, conservative, nthreads=4, ntranscriptionthreads=2, data_dir=get_datadir('webdata')):
-
-    # Need to convert transcript file into a text object
-    tf = codecs.open(tranfile, 'r', encoding='utf-8')
-    tran = tf.read().replace('\n', '') 
-    tf.close()
-
-    # And need to read audio file into a file object
-    af = open(audiofile, 'rb')
-    audio = af.read()
-    af.close()
-
-    # Scripted version should always be synchronous
-    async = False
-
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir)
-
-    zip_dir = os.path.join(data_dir, 'zip')
-    if not os.path.exists(zip_dir):
-        os.makedirs(zip_dir)
-
-    #f = File(data_dir)
-    #f.putChild('', File(get_resource('www/index.html')))
-    #f.putChild('status.html', File(get_resource('www/status.html')))
-    #f.putChild('preloader.gif', File(get_resource('www/preloader.gif')))
-
-    trans = Transcriber(data_dir, nthreads=nthreads, ntranscriptionthreads=ntranscriptionthreads)
-    #trans_ctrl = TranscriptionsController(trans)
-    #f.putChild('transcriptions', trans_ctrl)
-
-    #trans_zippr = TranscriptionZipper(zip_dir, trans)
-    #f.putChild('zip', trans_zippr)
-
-    #s = Site(f)
-    #logging.info("about to listen")
-    #reactor.listenTCP(port, s, interface=interface)
-    #logging.info("listening")
-
-    #reactor.run(installSignalHandlers=installSignalHandlers)
-
-    #uid = self.transcriber.next_id()
-    uid = trans.next_id()
-
-    #tran = req.args.get('transcript', [''])[0]
-    #audio = req.args['audio'][0]
-
-    #disfluency = True if 'disfluency' in req.args else False
-    #conservative = True if 'conservative' in req.args else False
-    kwargs = {'disfluency': disfluency,
-              'conservative': conservative,
-              'disfluencies': set(['uh', 'um'])}
-
-    #async = True
-    #if 'async' in req.args and req.args['async'][0] == 'false':
-    #    async = False
-
-    # We need to make the transcription directory here, so that
-    # when we redirect the user we are sure that there's a place
-    # for them to go.
-    outdir = os.path.join(trans.data_dir, 'transcriptions', uid)
-    os.makedirs(outdir)
-
-    logging.info('Running alignment of ' + tranfile + ' with ' + audiofile + ' into ' + uid)
-    trans.transcribe(uid, tran, audio, async, **kwargs)
-
-
-
-if __name__=='__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description='Align a transcript to audio by generating a new language model.')
-    parser.add_argument('--transcript', default=None,
-                       help='transcript file to align')
-    parser.add_argument('--audio', default=None,
-                       help='audio file (MP3 or WAV) to align')
-    parser.add_argument('--disfluency', default=False, type=bool,
-                       help='include ums and uhs in transcript')
-    parser.add_argument('--conservative', default=False, type=bool,
-                       help='be less gentle')
-    #parser.add_argument('--host', default="0.0.0.0",
-    #                   help='host to run http server on')
-    #parser.add_argument('--port', default=8765, type=int,
-    #                    help='port number to run http server on')
-    parser.add_argument('--nthreads', default=multiprocessing.cpu_count(), type=int,
-                        help='number of alignment threads')
-    parser.add_argument('--ntranscriptionthreads', default=2, type=int,
-                        help='number of full-transcription threads (memory intensive)')
-    parser.add_argument('--log', default="INFO",
-                        help='the log level (DEBUG, INFO, WARNING, ERROR, or CRITICAL)')
-
-    if len(sys.argv)==1:
-      parser.print_help()
-      sys.exit(1)
-
-    args = parser.parse_args()
-
-    log_level = args.log.upper()
-    logging.getLogger().setLevel(log_level)
-
-    logging.info('gentle %s' % (gentle.__version__))
-    #logging.info('listening at %s:%d\n' % (args.host, args.port))
-
-    #serve(args.port, args.host, nthreads=args.nthreads, ntranscriptionthreads=args.ntranscriptionthreads, installSignalHandlers=1)
-    do_align(args.transcript, args.audio, args.disfluency, args.conservative, args.nthreads, args.ntranscriptionthreads)
+parser = argparse.ArgumentParser(
+        description='Align a transcript to audio by generating a new language model.  Outputs JSON')
+parser.add_argument(
+        '--nthreads', default=multiprocessing.cpu_count(), type=int,
+        help='number of alignment threads')
+parser.add_argument(
+        '-o', '--output', metavar='output', type=str, 
+        help='output filename')
+parser.add_argument(
+        '--conservative', dest='conservative', action='store_true',
+        help='conservative alignment')
+parser.set_defaults(conservative=False)
+parser.add_argument(
+        '--disfluency', dest='disfluency', action='store_true',
+        help='include disfluencies (uh, um) in alignment')
+parser.set_defaults(disfluency=False)
+parser.add_argument(
+        '--log', default="INFO",
+        help='the log level (DEBUG, INFO, WARNING, ERROR, or CRITICAL)')
+parser.add_argument(
+        'audiofile', type=str,
+        help='audio file')
+parser.add_argument(
+        'txtfile', type=str,
+        help='transcript text file')
+args = parser.parse_args()
+
+log_level = args.log.upper()
+logging.getLogger().setLevel(log_level)
+
+disfluencies = set(['uh', 'um'])
+
+def on_progress(p):
+    for k,v in p.items():
+        logging.debug("%s: %s" % (k, v))
+
+
+with open(args.txtfile) as fh:
+    transcript = fh.read()
+
+resources = gentle.Resources()
+logging.info("converting audio to 8K sampled wav")
+
+with gentle.resampled(args.audiofile) as wavfile:
+    logging.info("starting alignment")
+    aligner = gentle.ForcedAligner(resources, transcript, nthreads=args.nthreads, disfluency=args.disfluency, conservative=args.conservative, disfluencies=disfluencies)
+    result = aligner.transcribe(wavfile, progress_cb=on_progress, logging=logging)
+
+fh = open(args.output, 'w') if args.output else sys.stdout
+fh.write(result.to_json(indent=2))
+if args.output:
+    logging.info("output written to %s" % (args.output))
