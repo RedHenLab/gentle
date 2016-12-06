@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
@@ -15,13 +14,13 @@ import json
 import logging
 import multiprocessing
 import os
-from Queue import Queue
+#from Queue import Queue
 import shutil
 import uuid
 import wave
 
 from gentle.paths import get_resource, get_datadir
-from gentle.transcription import to_csv, MultiThreadedTranscriber
+from gentle.transcription import Transcription
 from gentle.cyst import Insist
 from gentle.ffmpeg import to_wav
 from gentle import diff_align
@@ -29,6 +28,11 @@ from gentle import language_model
 from gentle import metasentence
 from gentle import multipass
 from gentle import standard_kaldi
+import gentle
+
+from util.paths import get_resource, get_datadir
+from util.cyst import Insist
+
 import gentle
 
 # PMB: Not used in standalone case
@@ -46,28 +50,9 @@ class Transcriber():
         self.data_dir = data_dir
         self.nthreads = nthreads
         self.ntranscriptionthreads = ntranscriptionthreads
+        self.resources = gentle.Resources()
 
-        proto_langdir = get_resource('PROTO_LANGDIR')
-        vocab_path = os.path.join(proto_langdir, "graphdir/words.txt")
-        with open(vocab_path) as f:
-            self.vocab = metasentence.load_vocabulary(f)
-
-        # load kaldi instances for full transcription
-        gen_hclg_filename = get_resource('data/graph/HCLG.fst')
-
-        if os.path.exists(gen_hclg_filename) and self.ntranscriptionthreads > 0:
-            proto_langdir = get_resource('PROTO_LANGDIR')
-            nnet_gpu_path = get_resource('data/nnet_a_gpu_online')
-
-            kaldi_queue = Queue()
-            for i in range(self.ntranscriptionthreads):
-                kaldi_queue.put(standard_kaldi.Kaldi(
-                    nnet_gpu_path,
-                    gen_hclg_filename,
-                    proto_langdir)
-                )
-            self.full_transcriber = MultiThreadedTranscriber(kaldi_queue, nthreads=self.ntranscriptionthreads)
-
+        self.full_transcriber = gentle.FullTranscriber(self.resources, nthreads=ntranscriptionthreads)
         self._status_dicts = {}
 
     def get_status(self, uid):
@@ -84,8 +69,6 @@ class Transcriber():
         return uid
 
     def transcribe(self, uid, transcript, audio, async, **kwargs):
-
-        proto_langdir = get_resource('PROTO_LANGDIR')
 
         status = self.get_status(uid)
 
@@ -106,7 +89,7 @@ class Transcriber():
         status['status'] = 'ENCODING'
 
         wavfile = os.path.join(outdir, 'a.wav')
-        if to_wav(os.path.join(outdir, 'upload'), wavfile) != 0:
+        if gentle.resample(os.path.join(outdir, 'upload'), wavfile) != 0:
             status['status'] = 'ERROR'
             status['error'] = "Encoding failed. Make sure that you've uploaded a valid media file."
             # Save the status so that errors are recovered on restart of the server
@@ -126,63 +109,28 @@ class Transcriber():
                 status[k] = v
 
         if len(transcript.strip()) > 0:
-            ms = metasentence.MetaSentence(transcript, self.vocab)
-            ks = ms.get_kaldi_sequence()
-            gen_hclg_filename = language_model.make_bigram_language_model(ks, proto_langdir, **kwargs)
-
-            kaldi_queue = Queue()
-            for i in range(self.nthreads):
-                kaldi_queue.put(standard_kaldi.Kaldi(
-                    get_resource('data/nnet_a_gpu_online'),
-                    gen_hclg_filename,
-                    proto_langdir)
-                )
-
-            mtt = MultiThreadedTranscriber(kaldi_queue, nthreads=self.nthreads)
-        elif hasattr(self, 'full_transcriber'):
-            mtt = self.full_transcriber
+            trans = gentle.ForcedAligner(self.resources, transcript, nthreads=self.nthreads, **kwargs)
+        elif self.full_transcriber.available:
+            trans = self.full_transcriber
         else:
             status['status'] = 'ERROR'
             status['error']  = 'No transcript provided and no language model for full transcription'
             return
 
-        words = mtt.transcribe(wavfile, progress_cb=on_progress)
-        output = {}
-        if len(transcript.strip()) > 0:
-            # Clear queue (would this be gc'ed?)
-            for i in range(self.nthreads):
-                k = kaldi_queue.get()
-                k.stop()
-
-            # Align words
-            output['words'] = diff_align.align(words, ms, **kwargs)
-            output['transcript'] = transcript
-
-            # Perform a second-pass with unaligned words
-            logging.info("%d unaligned words (of %d)" % (len([X for X in output['words'] if X.get("case") == "not-found-in-audio"]), len(output['words'])))
-
-            status['status'] = 'ALIGNING'
-
-            output['words'] = multipass.realign(wavfile, output['words'], ms, nthreads=self.nthreads, progress_cb=on_progress)
-
-            logging.info("after 2nd pass: %d unaligned words (of %d)" % (len([X for X in output['words'] if X.get("case") == "not-found-in-audio"]), len(output['words'])))
-
-        else:
-            # Match format
-            output = make_transcription_alignment({"words": words})
+        output = trans.transcribe(wavfile, progress_cb=on_progress, logging=logging)
 
         # ...remove the original upload
         os.unlink(os.path.join(outdir, 'upload'))
 
         # Save
         with open(os.path.join(outdir, 'align.json'), 'w') as jsfile:
-            json.dump(output, jsfile, indent=2)
+            jsfile.write(output.to_json(indent=2))
         with open(os.path.join(outdir, 'align.csv'), 'w') as csvfile:
-            csvfile.write(to_csv(output))
+            csvfile.write(output.to_csv())
 
         # Inline the alignment into the index.html file.
         htmltxt = open(get_resource('www/view_alignment.html')).read()
-        htmltxt = htmltxt.replace("var INLINE_JSON;", "var INLINE_JSON=%s;" % (json.dumps(output)));
+        htmltxt = htmltxt.replace("var INLINE_JSON;", "var INLINE_JSON=%s;" % (output.to_json()));
         open(os.path.join(outdir, 'index.html'), 'w').write(htmltxt)
 
         status['status'] = 'OK'
@@ -418,65 +366,3 @@ if __name__=='__main__':
 
     #serve(args.port, args.host, nthreads=args.nthreads, ntranscriptionthreads=args.ntranscriptionthreads, installSignalHandlers=1)
     do_align(args.transcript, args.audio, args.disfluency, args.conservative, args.nthreads, args.ntranscriptionthreads)
-=======
-import argparse
-import logging
-import multiprocessing
-import os
-import sys
-
-import gentle
-
-parser = argparse.ArgumentParser(
-        description='Align a transcript to audio by generating a new language model.  Outputs JSON')
-parser.add_argument(
-        '--nthreads', default=multiprocessing.cpu_count(), type=int,
-        help='number of alignment threads')
-parser.add_argument(
-        '-o', '--output', metavar='output', type=str, 
-        help='output filename')
-parser.add_argument(
-        '--conservative', dest='conservative', action='store_true',
-        help='conservative alignment')
-parser.set_defaults(conservative=False)
-parser.add_argument(
-        '--disfluency', dest='disfluency', action='store_true',
-        help='include disfluencies (uh, um) in alignment')
-parser.set_defaults(disfluency=False)
-parser.add_argument(
-        '--log', default="INFO",
-        help='the log level (DEBUG, INFO, WARNING, ERROR, or CRITICAL)')
-parser.add_argument(
-        'audiofile', type=str,
-        help='audio file')
-parser.add_argument(
-        'txtfile', type=str,
-        help='transcript text file')
-args = parser.parse_args()
-
-log_level = args.log.upper()
-logging.getLogger().setLevel(log_level)
-
-disfluencies = set(['uh', 'um'])
-
-def on_progress(p):
-    for k,v in p.items():
-        logging.debug("%s: %s" % (k, v))
-
-
-with open(args.txtfile) as fh:
-    transcript = fh.read()
-
-resources = gentle.Resources()
-logging.info("converting audio to 8K sampled wav")
-
-with gentle.resampled(args.audiofile) as wavfile:
-    logging.info("starting alignment")
-    aligner = gentle.ForcedAligner(resources, transcript, nthreads=args.nthreads, disfluency=args.disfluency, conservative=args.conservative, disfluencies=disfluencies)
-    result = aligner.transcribe(wavfile, progress_cb=on_progress, logging=logging)
-
-fh = open(args.output, 'w') if args.output else sys.stdout
-fh.write(result.to_json(indent=2))
-if args.output:
-    logging.info("output written to %s" % (args.output))
->>>>>>> master
