@@ -60,9 +60,7 @@ with gentle.resampled(args.audiofile) as wavfile:
 
 fh = open(args.output, 'w') if args.output else sys.stdout
 
-if (args.format == 'json'):
-  fh.write(result.to_json(indent=2))
-elif (args.format == 'lines'):
+if (args.format == 'jsonl'):
   resultJSON = json.loads(result.to_json(indent=2))
   for item in resultJSON['words']:
     if (item['case'] == "success"):
@@ -71,6 +69,8 @@ elif (args.format == 'lines'):
       line = {'word': item['word'], 'start': 'NA', 'end': 'NA'}
     json.dump(line, fh)
     fh.write("\n")
+else: # (args.format == 'json'):
+  fh.write(result.to_json(indent=2))
 
 if args.output:
     logging.info("output written to %s" % (args.output))
