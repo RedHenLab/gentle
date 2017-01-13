@@ -101,7 +101,7 @@ if (args.format == 'jsonl'):
         json.dump(prePunctLine, fh)
         fh.write("\n")
 
-      line = {'word': item['word'], 'start': item['start'], 'end': item['end']}
+      line = {'word': item['word'], 'start': "{0:.2f}".format(item['start']), 'end': "{0:.2f}".format(item['end'])}
       json.dump(line, fh)
       fh.write("\n")
 
