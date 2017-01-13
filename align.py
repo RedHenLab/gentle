@@ -74,36 +74,45 @@ if (args.format == 'jsonl'):
 
     if (item['case'] == "success"):
 
+      prePunctuation = ""
+      postPunctuation = ""
+      prePunctLine = None
+      postPunctLine = None
+
       # Special case: first word is preceded by puncutation
       if ((index == 0) and (int(item['startOffset']) > 0)):
         prePunctuation = transText[0:int(item['startOffset'])].strip()
+        if (prePunctuation != ""):
+          prePunctLine = {'punctuation': prePunctuation}
 
       # Final case: last word
       if (index == (wordsLen - 1)):
         postPunctuation = transText[int(item['endOffset']):len(transText)].strip()
-        withPunctuation = prePunctuation + item['word'] + postPunctuation
+        if (postPunctuation != ""):
+          postPunctLine = {'punctuation': postPunctuation}
+
       else: # (index <= (wordsLen - 1)):
         nextOffset = resultJSON['words'][index + 1]['startOffset']
         postPunctuation = transText[int(item['endOffset']):int(nextOffset)].strip()
+        if (postPunctuation != ""):
+          postPunctLine = {'punctuation': postPunctuation}
 
-        # Case in which there are multiple instances of punctuation separated
-        # by spaces between this token and the next one. Attach the first
-        # instance to this word, and the last to the next word.
-        postPunctArray = postPunctuation.split(' ')
-        if (len(postPunctArray) > 1):
-          postPunctuation = punctArray[0].strip()
-          withPunctuation = prePunctuation + item['word'] + postPunctutation
-          prePunctuation = punctArray[-1].strip()
-        else:
-          prePunctuation = ""
-          withPunctuation = item['word'] + postPunctuation
+      if (prePunctLine is not None):
+        json.dump(prePunctLine, fh)
+        fh.write("\n")
 
-      line = {'word': item['word'], 'start': item['start'], 'end': item['end'], 'withPunctuation': withPunctuation}
-          
+      line = {'word': item['word'], 'start': item['start'], 'end': item['end']}
+      json.dump(line, fh)
+      fh.write("\n")
+
+      if (postPunctLine is not None):
+        json.dump(postPunctLine, fh)
+        fh.write("\n")
+
     else:
-      line = {'word': item['word'], 'start': 'NA', 'end': 'NA', 'withPunctuation': 'NA'}
-    json.dump(line, fh)
-    fh.write("\n")
+      line = {'word': item['word'], 'start': 'NA', 'end': 'NA'}
+      json.dump(line, fh)
+      fh.write("\n")
 else: # (args.format == 'json'):
   fh.write(result.to_json(indent=2))
 
