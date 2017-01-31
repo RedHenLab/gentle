@@ -61,6 +61,12 @@ with gentle.resampled(args.audiofile) as wavfile:
 fh = open(args.output, 'w') if args.output else sys.stdout
 
 if (args.format == 'jsonl'):
+  #rawJSON = json.loads(result.to_json(indent=2))
+  #resultJSON = {'transcript': rawJSON['transcript'], 'words': []}
+  #for item in rawJSON['words']:
+  #  if (item['case'] == "success"):
+  #    resultJSON['words'].append(item) 
+
   resultJSON = json.loads(result.to_json(indent=2))
   transText = resultJSON['transcript']
   wordsLen = len(resultJSON['words'])
@@ -72,7 +78,10 @@ if (args.format == 'jsonl'):
 
   for index, item in enumerate(resultJSON['words']):
 
-    if (item['case'] == "success"):
+    # If "include disfluencies" is enabled, gentle will insert detected "ums"
+    # and "ahs", etc. with valid time codes but no offsets in the transcript
+    # (because they aren't transcribed).
+    if ((item['case'] == "success") or (item['case'] == 'not-found-in-transcript')):
 
       prePunctuation = ""
       postPunctuation = ""
@@ -80,20 +89,22 @@ if (args.format == 'jsonl'):
       postPunctLine = None
 
       # Special case: first word is preceded by puncutation
-      if ((index == 0) and (int(item['startOffset']) > 0)):
+      if ((index == 0) and (item['case'] == "success") and (int(item['startOffset']) > 0)):
         prePunctuation = transText[0:int(item['startOffset'])].strip()
         if (prePunctuation != ""):
           prePunctLine = {'punctuation': prePunctuation}
 
       # Final case: last word
-      if (index == (wordsLen - 1)):
+      if ((index == (wordsLen - 1)) and (item['case'] == "success")):
         postPunctuation = transText[int(item['endOffset']):len(transText)].strip()
         if (postPunctuation != ""):
           postPunctLine = {'punctuation': postPunctuation}
 
       else: # (index <= (wordsLen - 1)):
-        nextOffset = resultJSON['words'][index + 1]['startOffset']
-        postPunctuation = transText[int(item['endOffset']):int(nextOffset)].strip()
+
+        if ((item['case'] == "success") and (resultJSON['words'][index + 1]['case'] == "success")):
+          nextOffset = resultJSON['words'][index + 1]['startOffset']
+          postPunctuation = transText[int(item['endOffset']):int(nextOffset)].strip()
         if (postPunctuation != ""):
           postPunctLine = {'punctuation': postPunctuation}
 
